@@ -2174,6 +2174,8 @@ EOL
     inject_var url_server "$url_server"
     inject_var url_hotspot "$url_hotspot"
     inject_var rci_token "$rci_token"
+    inject_var ru_exclude_ipv4 "$ru_exclude_ipv4"
+    inject_var ru_exclude_ipv6 "$ru_exclude_ipv6"
     # GOMEMLIMIT для respawn mihomo внутри хука (вычислен при генерации)
     apply_gomemlimit
     inject_var gomemlimit_value "$gomemlimit_value"
@@ -2955,6 +2957,26 @@ USER_POLICIES_EOF
         fi
     }
 
+    # OOM can leave an existing geo set empty even though its list is valid.
+    # On renew refill only that broken state; normal renews stay inexpensive.
+    _xkeen_refill_geo_if_empty() {
+        _rg_set="$1"
+        _rg_file="$2"
+        _rg_family="$3"
+        [ -s "$_rg_file" ] || return 0
+        ipset save "$_rg_set" 2>/dev/null | grep -q '^add ' && return 0
+        _rg_tmp="${_rg_set}_renew_tmp"
+        ipset create "$_rg_tmp" hash:net family "$_rg_family" -exist 2>/dev/null || return 1
+        ipset flush "$_rg_tmp" 2>/dev/null
+        if sed -e 's/\r$//' -e 's/#.*//' -e '/^[[:space:]]*$/d' "$_rg_file" | \
+             awk '{print "add '"$_rg_tmp"' "$1}' | ipset restore -exist; then
+            ipset swap "$_rg_set" "$_rg_tmp" 2>/dev/null || return 1
+        else
+            logger -p daemon.warning -t xkeen "не удалось восстановить $_rg_set из $_rg_file"
+        fi
+        ipset destroy "$_rg_tmp" 2>/dev/null
+    }
+
     _xkeen_cache_valid() {
         [ -s "$_xkeen_cache_dir/key" ] || return 1
         [ "$(cat "$_xkeen_cache_dir/key" 2>/dev/null)" = "$(md5sum "$0" 2>/dev/null | awk '{print $1}')" ]
@@ -2999,6 +3021,8 @@ USER_POLICIES_EOF
 
     if _xkeen_cache_valid; then
         _xkeen_ensure_ipsets
+        [ "$iptables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude "$ru_exclude_ipv4" inet
+        [ "$ip6tables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude6 "$ru_exclude_ipv6" inet6
         _xkeen_cache_load
         [ "$iptables_supported" = "true" ] && configure_route 4
         [ "$ip6tables_supported" = "true" ] && configure_route 6
@@ -3755,9 +3779,8 @@ wait_for_ready() {
             # Проверка готовности API политик и модуля xt_TPROXY
             api_policy_json=$(curl_api "${url_server}/${url_policy}" 2>/dev/null)
             case "$api_policy_json" in
-                ""|"{}")
-                    ;;
-                \{*)
+                ""|"{}"|"[]") return 0 ;;
+                \{*|\[*)
                     if [ -z "$_probe_ko" ] \
                        || grep -q '^xt_TPROXY ' /proc/modules 2>/dev/null \
                        || insmod "$_probe_ko" >/dev/null 2>&1
@@ -3779,6 +3802,30 @@ wait_for_ready() {
 #
 # $1 = allow-timeout — на cold start (сеть может быть ещё недоступна
 # из‑за rule-providers) таймаут не блокирует запуск.
+run_validation_watchdog() {
+    _rv_tmp="/tmp/xkeen-validate.$$"
+    rm -f "$_rv_tmp"
+    "$@" > "$_rv_tmp" 2>&1 &
+    _rv_pid=$!
+    _rv_wait=0
+    while kill -0 "$_rv_pid" 2>/dev/null && [ "$_rv_wait" -lt 30 ]; do
+        sleep 1
+        _rv_wait=$((_rv_wait + 1))
+    done
+    if kill -0 "$_rv_pid" 2>/dev/null; then
+        kill "$_rv_pid" 2>/dev/null
+        sleep 1
+        kill -9 "$_rv_pid" 2>/dev/null
+        wait "$_rv_pid" 2>/dev/null
+        _vc_rc=124
+    else
+        wait "$_rv_pid"
+        _vc_rc=$?
+    fi
+    _vc_out=$(cat "$_rv_tmp" 2>/dev/null)
+    rm -f "$_rv_tmp"
+}
+
 validate_core_config() {
     _vc_allow_timeout="$1"
     _vc_out=""
@@ -3802,13 +3849,11 @@ validate_core_config() {
                     export CLASH_HOME_DIR="$directory_configs_app"
                     timeout "$_vc_timeout" "$install_dir/mihomo" -t -d "$directory_configs_app" 2>&1
                 )
+                _vc_rc=$?
             else
-                _vc_out=$(
-                    export CLASH_HOME_DIR="$directory_configs_app"
-                    "$install_dir/mihomo" -t -d "$directory_configs_app" 2>&1
-                )
+                export CLASH_HOME_DIR="$directory_configs_app"
+                run_validation_watchdog "$install_dir/mihomo" -t -d "$directory_configs_app"
             fi
-            _vc_rc=$?
             ;;
         xray)
             if [ ! -x "$install_dir/xray" ]; then
@@ -3822,14 +3867,12 @@ validate_core_config() {
                     export XRAY_LOCATION_ASSET="$directory_xray_asset"
                     timeout "$_vc_timeout" "$install_dir/xray" run -test 2>&1
                 )
+                _vc_rc=$?
             else
-                _vc_out=$(
-                    export XRAY_LOCATION_CONFDIR="$directory_xray_config"
-                    export XRAY_LOCATION_ASSET="$directory_xray_asset"
-                    "$install_dir/xray" run -test 2>&1
-                )
+                export XRAY_LOCATION_CONFDIR="$directory_xray_config"
+                export XRAY_LOCATION_ASSET="$directory_xray_asset"
+                run_validation_watchdog "$install_dir/xray" run -test
             fi
-            _vc_rc=$?
             ;;
         *)
             echo -e "  ${red}Ошибка${reset}: неизвестный прокси-клиент ${yellow}$name_client${reset}" >&2
