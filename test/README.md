@@ -25,6 +25,8 @@
 - **(combined-build)** перед `-restart`/`-start` выполняется dry-run конфига (`mihomo -t` / `xray run -test`)
 - **(combined-build)** `-ug` на mihomo честно сообщает про `geo-auto-update`; шаблон config.yaml включает автообновление геоданных
 - **(combined-build)** атомарная установка XKeen + `gzip -t`/min-size для бинарников mihomo/xray
+- **(combined-build)** GOMEMLIMIT для mihomo настраивается в `xkeen.json` (`gomemlimit_percent` / `gomemlimit_mb`, дефолт 33%)
+- **(combined-build)** на DHCP renew с тем же WAN IP хук netfilter не трогает маршруты — только sync deny-MAC
 
 ### Порядок установки/обновления
 

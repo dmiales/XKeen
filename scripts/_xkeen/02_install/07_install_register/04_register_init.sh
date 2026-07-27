@@ -171,6 +171,52 @@ get_rci_token() {
 }
 get_rci_token
 
+# GOMEMLIMIT для mihomo: доля RAM или абсолютный лимит из xkeen.json.
+# Дефолт 33% (раньше было жёстко 50%) — на 256–512 МБ роутерах
+# оставляем больше места NDM/Entware. Внешний GOMEMLIMIT в окружении
+# всегда побеждает.
+load_gomemlimit_settings() {
+    gomemlimit_percent=33
+    gomemlimit_mb=""
+
+    [ ! -f "$xkeen_config" ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    _gml_json=$(strip_json_comments "$xkeen_config")
+    _gml_v=$(printf '%s' "$_gml_json" | jq -r '.xkeen.gomemlimit_percent // empty' 2>/dev/null)
+    if [ -n "$_gml_v" ] && [ "$_gml_v" -ge 1 ] 2>/dev/null && [ "$_gml_v" -le 90 ] 2>/dev/null; then
+        gomemlimit_percent="$_gml_v"
+    fi
+    _gml_v=$(printf '%s' "$_gml_json" | jq -r '.xkeen.gomemlimit_mb // empty' 2>/dev/null)
+    if [ -n "$_gml_v" ] && [ "$_gml_v" -ge 64 ] 2>/dev/null; then
+        gomemlimit_mb="$_gml_v"
+    fi
+    unset _gml_json _gml_v
+}
+
+# Выставляет GOMEMLIMIT и gomemlimit_value (для inject в netfilter-хук).
+apply_gomemlimit() {
+    [ -n "$GOMEMLIMIT" ] && { gomemlimit_value="$GOMEMLIMIT"; return 0; }
+
+    load_gomemlimit_settings
+    gomemlimit_value=""
+
+    if [ -n "$gomemlimit_mb" ]; then
+        gomemlimit_value="${gomemlimit_mb}MiB"
+        export GOMEMLIMIT="$gomemlimit_value"
+        return 0
+    fi
+
+    _mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] 2>/dev/null; then
+        _goml=$(( _mem_kb * gomemlimit_percent / 100 / 1024 ))
+        [ "$_goml" -lt 64 ] && _goml=64
+        gomemlimit_value="${_goml}MiB"
+        export GOMEMLIMIT="$gomemlimit_value"
+    fi
+    unset _mem_kb _goml
+}
+
 wait_for_webui() {
     max_wait=20
     i=0
@@ -2064,6 +2110,9 @@ EOL
     inject_var url_server "$url_server"
     inject_var url_hotspot "$url_hotspot"
     inject_var rci_token "$rci_token"
+    # GOMEMLIMIT для respawn mihomo внутри хука (вычислен при генерации)
+    apply_gomemlimit
+    inject_var gomemlimit_value "$gomemlimit_value"
 
     cat >> "$file_netfilter_hook" <<'EOL'
 
@@ -2776,10 +2825,26 @@ USER_POLICIES_EOF
         return 0
     }
 
+    # Текущий WAN IPv4 (тот же способ, что get_exclude_ip4 при генерации).
+    # На коротком DHCP lease (MGTS ~300 с) renew приходит каждые ~150 с
+    # с тем же IP: NDM всё равно зовёт netfilter.d. Если IP не сменился
+    # и цепочки на месте — не трогаем даже configure_route (он и так
+    # идемпотентен, но лишние ip route show на каждом renew не нужны).
+    _xkeen_wan_state="/tmp/xkeen_wan_ip"
+    _xkeen_cur_wan=$(ip -o route get 195.208.4.1 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p' || \
+                     ip -o route get 77.88.8.8 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p')
+    _xkeen_prev_wan=$(cat "$_xkeen_wan_state" 2>/dev/null)
+
+    if [ -n "$_xkeen_cur_wan" ] && [ "$_xkeen_cur_wan" = "$_xkeen_prev_wan" ] && _xkeen_rules_intact; then
+        _xkeen_sync_deny_mac_ipset
+        exit 0
+    fi
+
     if _xkeen_rules_intact; then
         [ "$iptables_supported" = "true" ] && configure_route 4
         [ "$ip6tables_supported" = "true" ] && configure_route 6
         _xkeen_sync_deny_mac_ipset
+        [ -n "$_xkeen_cur_wan" ] && printf '%s' "$_xkeen_cur_wan" > "$_xkeen_wan_state"
         exit 0
     fi
 
@@ -2844,6 +2909,7 @@ USER_POLICIES_EOF
         [ "$ip6tables_supported" = "true" ] && configure_route 6
         _xkeen_apply
         _xkeen_sync_deny_mac_ipset
+        [ -n "$_xkeen_cur_wan" ] && printf '%s' "$_xkeen_cur_wan" > "$_xkeen_wan_state"
         exit 0
     fi
 
@@ -2898,6 +2964,7 @@ USER_POLICIES_EOF
     # Медленная часть (curl к hotspot API) — строго после восстановления
     # правил: см. комментарий у _xkeen_sync_deny_mac_ipset.
     _xkeen_sync_deny_mac_ipset
+    [ -n "$_xkeen_cur_wan" ] && printf '%s' "$_xkeen_cur_wan" > "$_xkeen_wan_state"
 else
     [ -f "/tmp/xkeen_starting.lock" ] && exit 0
     touch "/tmp/xkeen_starting.lock"
@@ -2915,18 +2982,11 @@ else
         ;;
         mihomo)
             export CLASH_HOME_DIR="$directory_configs_app"
-            # mihomo — Go-приложение: без GOMEMLIMIT сборщик мусора не
-            # стремится возвращать память ОС, и на роутерах RSS ползёт
-            # вверх до OOM. Мягкий лимит в половину RAM (минимум 64MiB)
-            # заставляет GC ужиматься заранее. Уже заданный извне
-            # GOMEMLIMIT не игнорируется.
-            if [ -z "$GOMEMLIMIT" ]; then
-                _mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
-                if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] 2>/dev/null; then
-                    _goml=$(( _mem_kb / 2048 ))
-                    [ "$_goml" -lt 64 ] && _goml=64
-                    export GOMEMLIMIT="${_goml}MiB"
-                fi
+            # Мягкий лимит памяти для Go GC. Значение запекается при
+            # configure_firewall из xkeen.json (gomemlimit_percent /
+            # gomemlimit_mb) или внешнего GOMEMLIMIT.
+            if [ -z "$GOMEMLIMIT" ] && [ -n "$gomemlimit_value" ]; then
+                export GOMEMLIMIT="$gomemlimit_value"
             fi
             "$name_client" >/dev/null 2>&1 &
         ;;
@@ -3352,17 +3412,9 @@ proxy_start() {
                     ;;
                     mihomo)
                         export CLASH_HOME_DIR="$directory_configs_app"
-                        # См. комментарий у запуска mihomo в netfilter-хуке:
-                        # мягкий лимит памяти для Go GC, половина RAM,
+                        # См. apply_gomemlimit: доля/лимит из xkeen.json,
                         # минимум 64MiB, внешний GOMEMLIMIT не игнорируется.
-                        if [ -z "$GOMEMLIMIT" ]; then
-                            _mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
-                            if [ -n "$_mem_kb" ] && [ "$_mem_kb" -gt 0 ] 2>/dev/null; then
-                                _goml=$(( _mem_kb / 2048 ))
-                                [ "$_goml" -lt 64 ] && _goml=64
-                                export GOMEMLIMIT="${_goml}MiB"
-                            fi
-                        fi
+                        apply_gomemlimit
                         if [ -n "$fd_out" ]; then
                             nohup "$name_client" >/dev/null 2>&1 &
                             unset fd_out
