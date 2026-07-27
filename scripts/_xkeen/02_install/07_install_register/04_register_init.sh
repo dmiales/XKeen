@@ -44,16 +44,14 @@ file_port_proxying="$xkeen_cfg/port_proxying.lst"
 file_port_exclude="$xkeen_cfg/port_exclude.lst"
 file_ip_exclude="$xkeen_cfg/ip_exclude.lst"
 xkeen_config="$xkeen_cfg/xkeen.json"
-status_file="/opt/lib/opkg/status"
 file_pid_fd="/var/run/xkeen_fd.pid"
-file_cpu="/opt/sbin/.xkeen/01_info/08_info_router.sh"
 file_ca="/opt/etc/ssl/certs/ca-certificates.crt"
 ru_exclude_ipv4="$ipset_cfg/ru_exclude_ipv4.lst"
 ru_exclude_ipv6="$ipset_cfg/ru_exclude_ipv6.lst"
 ru_override="$ipset_cfg/ru_exclude_override.lst"
 
 # URL
-url_server="localhost:79"
+url_server="127.0.0.1:79"
 url_policy="rci/show/ip/policy"
 url_keenetic_port="rci/ip/http"
 url_redirect_port="rci/ip/static"
@@ -128,6 +126,104 @@ if [ "$dscp_enable" = "off" ]; then
     dscp_exclude=""
     dscp_proxy=""
 fi
+
+# Дубль функции из 01_info_variable.sh: этот файл побайтово копируется в
+# init.d/S05xkeen и модули не подключает, поэтому правки нужны в обоих местах.
+# Обоснование разбора состоянием — там же.
+strip_json_comments() {
+    awk '
+    {
+        line = ""; i = 1; n = length($0); instr = 0; esc = 0
+        while (i <= n) {
+            c = substr($0, i, 1)
+            if (inblk) {
+                if (c == "*" && substr($0, i + 1, 1) == "/") { inblk = 0; i += 2 } else i++
+                continue
+            }
+            if (instr) {
+                line = line c
+                if (esc) esc = 0
+                else if (c == "\\") esc = 1
+                else if (c == "\"") instr = 0
+                i++
+                continue
+            }
+            if (c == "\"") { instr = 1; line = line c; i++; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "*") { inblk = 1; i += 2; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "/") break
+            line = line c; i++
+        }
+        print line
+    }' "$@"
+}
+
+# Функция извлечения rci-токена
+get_rci_token() {
+    rci_token=""
+    [ ! -f "$xkeen_config" ] && return 1
+
+    local json_clean
+    json_clean=$(strip_json_comments "$xkeen_config")
+
+    rci_token=$(printf '%s' "$json_clean" | sed -n 's/.*"rci_token": *"\([^"]*\)".*/\1/p' | xargs 2>/dev/null)
+
+    [ "$rci_token" = "null" ] && rci_token=""
+}
+get_rci_token
+
+wait_for_webui() {
+    max_wait=20
+    i=0
+
+    while [ "$i" -lt "$max_wait" ]; do
+        pidof nginx >/dev/null 2>&1 && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
+wait_for_rci_token() {
+    [ -n "$rci_token" ] || return 1
+
+    wait_for_webui || {
+        log_error_router "Веб-интерфейс недоступен"
+        return 1
+    }
+
+    http_code=$(curl -ksS -o /dev/null -w "%{http_code}" -H "X-Ndma-Tkn: $rci_token" "${url_server}/${url_policy}")
+
+    case "$http_code" in
+        200) return 0 ;;
+        401|403)
+            log_error_router "Отсутствует или недействителен токен доступа к RCI роутера"
+            log_error_terminal "Отсутствует или недействителен токен доступа к RCI роутера"
+            ;;
+        *)
+            log_error_router "RCI не отвечает (http_code=$http_code)"
+            log_error_terminal "RCI не отвечает (http_code=$http_code)"
+            ;;
+    esac
+}
+wait_for_rci_token
+
+# Параметры curl
+curl_api() {
+    if [ -n "$rci_token" ]; then
+        curl --connect-timeout 2 -m 5 -kfsS -H "X-Ndma-Tkn: $rci_token" "$@"
+    else
+        curl --connect-timeout 2 -m 5 -kfsS "$@"
+    fi
+}
+
+detect_architecture() {
+    arm_cpu="false"
+    command -v opkg >/dev/null 2>&1 || return
+    case "$(opkg print-architecture | awk '!/all/ {print $2; exit}')" in
+        aarch64*) arm_cpu="true" ;;
+    esac
+}
 
 print_policy_info() {
     found="$1"
@@ -233,8 +329,6 @@ fi
 
 log_clean() { [ "$name_client" = "xray" ] && : > "$log_access" && : > "$log_error"; }
 
-curl_api() { curl --connect-timeout 2 -m 5 -kfsS "$@"; }
-
 api_cache_init() {
     api_policy_json=$(curl_api "${url_server}/${url_policy}" 2>/dev/null)
     api_port_json=$(curl_api "${url_server}/${url_keenetic_port}" 2>/dev/null)
@@ -269,19 +363,6 @@ get_keenetic_port() {
     return 0
 }
 
-wait_for_webui() {
-    max_wait=10
-    i=0
-
-    while [ "$i" -lt "$max_wait" ]; do
-        pidof nginx >/dev/null 2>&1 && return 0
-        sleep 1
-        i=$((i + 1))
-    done
-
-    return 1
-}
-
 apply_ipv6_state() {
     ipv6_disabled=
     ipv6_disabled=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "0")
@@ -291,10 +372,6 @@ apply_ipv6_state() {
     [ "$ipv6_support" != "off" ] && return 0
 
     ip -6 addr show 2>/dev/null | grep -q "inet6 fe80::" || return 0
-
-    wait_for_webui || { log_error_router "Веб-интерфейс недоступен"; return 1; }
-
-    sleep 5
 
     sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
 
@@ -326,12 +403,6 @@ get_ipver_support() {
 
     iptables_supported=$([ "$ip4_supported" = "true" ] && command -v iptables >/dev/null 2>&1 && echo true || echo false)
     ip6tables_supported=$([ "$ip6_supported" = "true" ] && command -v ip6tables >/dev/null 2>&1 && echo true || echo false)
-}
-
-strip_json_comments() {
-    sed -e ':a; s:/\*[^*]*\*[^/]*\*/::g; ta' \
-        -e 's/^[[:space:]]*\/\/.*$//' \
-        -e 's/[[:space:]]\{1,\}\/\/.*$//' "$@"
 }
 
 append_multiline() {
@@ -743,13 +814,18 @@ $config_hint
 "
     else
         log_warning_terminal "
-  Проксирование Entware включено, но у исходящих подключений ${yellow}${name_client}${reset} ${validation_summary} ${yellow}mark/routing-mark${reset} для bypass$error_details
+  Для проксирования трафика Entware требуется его маркировка
+  В конфигурации ${yellow}${name_client}${reset} ${validation_summary} ${yellow}mark/routing-mark${reset} для bypass$error_details
 
   Для обычного Entware proxy можно использовать служебную метку ${yellow}255${reset}
   Разрешённые bypass marks: ${yellow}${allowed_marks_display}${reset}
 $config_hint
   Если нужно направить сам ${yellow}${name_client}${reset} через конкретную политику Keenetic, используйте код из ${yellow}xkeen -pbr codes${reset}
+
+  Отсутствие маркировки в этом режиме приведет к петле трафика и зависанию роутера
+  Проксирование трафика Entware ${red}отключено${reset} для безопасности
 "
+        proxy_router="off"
     fi
 
     return 0
@@ -925,9 +1001,23 @@ check_dns_config() {
 }
 file_dns=$(check_dns_config)
 
+# Кэш зарегистрированных в ядре модулей
+_registered_modules=""
+_load_registered_modules_cache() {
+    for _f in /proc/net/ip_tables_matches /proc/net/ip_tables_targets; do
+        [ -f "$_f" ] || continue
+        while IFS= read -r _n; do
+            [ -n "$_n" ] && _registered_modules="$_registered_modules xt_$_n"
+        done < "$_f"
+    done
+
+    _registered_modules=" $_registered_modules "
+}
+_load_registered_modules_cache
+
 # Кэш списка загруженных модулей; is_module_loaded читает его без форков
 _loaded_modules=""
-_refresh_modules_cache() { _loaded_modules=" $(lsmod 2>/dev/null | awk '{print $1}' | tr '\n' ' ') "; }
+_refresh_modules_cache() { _loaded_modules=" $(lsmod 2>/dev/null | awk '{print $1}' | tr '\n' ' ')$_registered_modules"; }
 
 is_module_loaded() {
     case "$_loaded_modules" in
@@ -1952,9 +2042,8 @@ EOL
     inject_var table_tproxy "$table_tproxy"
     inject_var table_mark "$table_mark"
     inject_var table_id "$table_id"
-    inject_var status_file "$status_file"
     inject_var file_dns "$file_dns"
-    inject_var file_cpu "$file_cpu"
+    inject_var arm_cpu "$arm_cpu"
     inject_var file_ca "$file_ca"
     inject_var proxy_dns "$proxy_dns"
     inject_var proxy_router "$proxy_router"
@@ -1974,12 +2063,21 @@ EOL
     inject_var name_ipset_deny_mac "$name_ipset_deny_mac"
     inject_var url_server "$url_server"
     inject_var url_hotspot "$url_hotspot"
+    inject_var rci_token "$rci_token"
 
     cat >> "$file_netfilter_hook" <<'EOL'
 
 # Перезапуск скрипта
 restart_script() {
     exec /bin/sh "$0" "$@"
+}
+
+curl_api() {
+    if [ -n "$rci_token" ]; then
+        curl --connect-timeout 2 -m 5 -kfsS -H "X-Ndma-Tkn: $rci_token" "$@"
+    else
+        curl --connect-timeout 2 -m 5 -kfsS "$@"
+    fi
 }
 
 if pidof "$name_client" >/dev/null; then
@@ -2028,7 +2126,7 @@ if pidof "$name_client" >/dev/null; then
         _tmp="${name_ipset_deny_mac}_tmp"
         ipset create "$_tmp" hash:mac -exist 2>/dev/null
         ipset flush "$_tmp" >/dev/null 2>&1
-        _hjson=$(curl --connect-timeout 2 -m 5 -kfsS "${url_server}/${url_hotspot}" 2>/dev/null)
+        _hjson=$(curl_api "${url_server}/${url_hotspot}" 2>/dev/null)
         if [ -n "$_hjson" ]; then
             printf '%s' "$_hjson" | jq -r '
                 ((.host // . // []) |
@@ -2569,6 +2667,9 @@ USER_POLICIES_EOF
         orig_chain="$chain"
         chain="$out_chain"
 
+        # Разрешаем traceroute 
+        ipt -A "$out_chain" -p udp --dport 33434:33534 $comment -j RETURN >/dev/null 2>&1
+
         ipt -A "$out_chain" -o lo $comment -j RETURN >/dev/null 2>&1
         ipt -A "$out_chain" -m mark --mark 255 $comment -j RETURN >/dev/null 2>&1
         policy_bypass_marks="$policy_mark"
@@ -2800,11 +2901,9 @@ USER_POLICIES_EOF
 else
     [ -f "/tmp/xkeen_starting.lock" ] && exit 0
     touch "/tmp/xkeen_starting.lock"
-    . "$file_cpu"
-    info_cpu
 
     fd_limit="$other_fd"
-    [ "$architecture" = "arm64-v8a" ] && fd_limit="$arm64_fd"
+    [ "$arm_cpu" = "true" ] && fd_limit="$arm64_fd"
     ulimit -SHn "$fd_limit"
 
     export SSL_CERT_FILE="$file_ca"
@@ -2974,12 +3073,6 @@ load_ipset() {
         ipset swap "$set" "$tmp"
     fi
     ipset destroy "$tmp"
-}
-
-apply_fd_limit() {
-    fd_limit="$other_fd"
-    [ "$architecture" = "arm64-v8a" ] && fd_limit="$arm64_fd"
-    ulimit -SHn "$fd_limit"
 }
 
 cleanup_fd_monitor() {
@@ -3158,6 +3251,7 @@ proxy_start() {
         sync_deny_mac_ipset
         process_user_ports
         process_custom_mark
+        detect_architecture
         port_redirect=$(get_port_redirect)
         network_redirect=$(get_network_redirect)
         port_tproxy=$(get_port_tproxy)
@@ -3221,8 +3315,11 @@ proxy_start() {
         else
             log_info_router "Инициирован запуск прокси-клиента"
             attempt=1
-            . "$file_cpu"
-            info_cpu
+
+            fd_limit="$other_fd"
+            [ "$arm_cpu" = "true" ] && fd_limit="$arm64_fd"
+            ulimit -SHn "$fd_limit"
+
             export SSL_CERT_FILE="$file_ca"
             while [ "$attempt" -le "$start_attempts" ]; do
                 case "$name_client" in
@@ -3230,7 +3327,6 @@ proxy_start() {
                         export XRAY_LOCATION_CONFDIR="$directory_xray_config"
                         export XRAY_LOCATION_ASSET="$directory_xray_asset"
                         find "$directory_xray_config" -maxdepth 1 -name '._*.json' -type f -delete
-                        apply_fd_limit
                         if [ -n "$fd_out" ]; then
                             nohup "$name_client" run >/dev/null 2>&1 &
                             unset fd_out
@@ -3255,7 +3351,6 @@ proxy_start() {
                                 export GOMEMLIMIT="${_goml}MiB"
                             fi
                         fi
-                        apply_fd_limit
                         if [ -n "$fd_out" ]; then
                             nohup "$name_client" >/dev/null 2>&1 &
                             unset fd_out

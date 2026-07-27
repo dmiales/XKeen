@@ -59,6 +59,18 @@ file_schedule_hook="/opt/etc/ndm/schedule.d/00-xkeen-hotspot-sync.sh"
 name_ipset_deny_mac="xkeen_deny_mac"
 
 # -------------------------------------
+# Балансировка по фактической скорости (xkeen -sb)
+# -------------------------------------
+sb_api_config="$xray_conf_dir/00_api.json"		 # блок gRPC api Xray
+sb_probe_config="$xray_conf_dir/00_probe.json"		 # probe http-proxy inbound для замера
+sb_api_addr="127.0.0.1:10085"				 # адрес gRPC api
+sb_probe_addr="127.0.0.1:10808"				 # адрес probe http-proxy
+sb_probe_intag="probe"					 # tag probe-inbound
+sb_rule_tag="xkeen-sb-probe"				 # ruleTag временного правила замера
+sb_rule_tmp="$tmp_dir/sb_probe_rule.json"		 # временный файл правила замера
+sb_log_file="$xray_log_dir/speed_balancer.log"		 # лог замеров и переключений
+
+# -------------------------------------
 # Ресурсы для проверки доступа в интернет
 # -------------------------------------
 conn_URL="ya.ru"
@@ -129,65 +141,43 @@ init_directories() {
     touch "$xray_error_log" || { echo "Ошибка: Не удалось создать файл $xray_error_log"; exit 1; }
 }
 
-# Параметры curl
-curl_api() { curl --connect-timeout 2 -m 5 -kfsS "$@"; }
-curl_with_timeout() {
-    # Функция динамической очистки и форматирования баров в реальном времени
-    indent_stderr_live() {
-        # Меняем RS (разделитель строк) в awk на '\r'. 
-        awk -v RS='\r' '{
-            # Удаляем мусор (таблицы, ошибки curl)
-            if ($0 ~ /(% Total|Average Speed|Time Current|curl:)/) next;
-            if ($0 ~ /^[[:space:]]*$/) next;
-            
-            # Если это самый первый символ прогресс-бара, делаем начальный отступ
-            if (first == 0 && $0 ~ /^[# ]/) {
-                printf "  "
-                first = 1
-            }
-            
-            # Выводим бар обратно в stderr с возвратом каретки и отступом
-            printf "%s\r  ", $0
-            fflush()
-        }
-        END {
-            # Если выполнение закончилось, принудительно сбрасываем каретку 
-            # в самый левый край (\r), чтобы стереть паразитный отступ для caller-скрипта
-            printf "\r"
-            fflush()
-        }' >&2
-    }
-
-    # Проверяем контекст: если вывод в /dev/null или это HEAD-запрос (-I), то это проверка (probe)
-    _is_probe=0
-    for _arg in "$@"; do
-        [ "$_arg" = "/dev/null" ] || [ "$_arg" = "-I" ] && _is_probe=1 && break
-    done
-
-    if [ "$_is_probe" = "0" ]; then
-        # Режим скачивания (fetch_with_mirrors)
-        if [ -e "/tmp/toff" ]; then
-            (curl -# --connect-timeout 10 "$@" 2>&1 1>&3 | indent_stderr_live) 3>&1
-        else
-            (curl -# --connect-timeout 10 -m 180 "$@" 2>&1 1>&3 | indent_stderr_live) 3>&1
-        fi
-        _curl_rc=$?
-
-        return $_curl_rc
-    else
-        # Режим проверки доступности (probe_with_mirrors / test_github)
-        if [ -e "/tmp/toff" ]; then
-            curl --connect-timeout 10 "$@"
-        else
-            curl --connect-timeout 10 -m 180 "$@"
-        fi
-    fi
-}
-
+# Вырезание комментариев перед подачей файла в jq: сам jq принимает только
+# строгий JSON, режима JSON5/JSONC у него нет.
+#
+# Разбор состоянием, а не регуляркой. Регулярка не отличает комментарий от
+# строкового значения: `/*` внутри строки склеивался бы со следующим настоящим
+# комментарием и вырезал кусок конфига, а ` // ` внутри строки обрезало бы
+# значение. Прежняя реализация вдобавок требовала лишнюю `*` внутри блока,
+# из-за чего обычный `/* текст */` не вырезался вовсе и jq падал.
+#
+# inblk намеренно живёт между строками — блочный комментарий многострочный.
+# instr сбрасывается на каждой строке: в JSON строка не может содержать
+# неэкранированный перевод строки.
 strip_json_comments() {
-    sed -e ':a; s:/\*[^*]*\*[^/]*\*/::g; ta' \
-        -e 's/^[[:space:]]*\/\/.*$//' \
-        -e 's/[[:space:]]\{1,\}\/\/.*$//' "$@"
+    awk '
+    {
+        line = ""; i = 1; n = length($0); instr = 0; esc = 0
+        while (i <= n) {
+            c = substr($0, i, 1)
+            if (inblk) {
+                if (c == "*" && substr($0, i + 1, 1) == "/") { inblk = 0; i += 2 } else i++
+                continue
+            }
+            if (instr) {
+                line = line c
+                if (esc) esc = 0
+                else if (c == "\\") esc = 1
+                else if (c == "\"") instr = 0
+                i++
+                continue
+            }
+            if (c == "\"") { instr = 1; line = line c; i++; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "*") { inblk = 1; i += 2; continue }
+            if (c == "/" && substr($0, i + 1, 1) == "/") break
+            line = line c; i++
+        }
+        print line
+    }' "$@"
 }
 
 # Параметры повтора загрузок
@@ -214,3 +204,153 @@ retries_download_settings() {
     fi
 }
 retries_download_settings
+
+# Функция извлечения rci-токена
+get_rci_token() {
+    rci_token=""
+    [ ! -f "$xkeen_config" ] && return 1
+
+    local json_clean
+    json_clean=$(strip_json_comments "$xkeen_config")
+
+    rci_token=$(printf '%s' "$json_clean" | sed -n 's/.*"rci_token": *"\([^"]*\)".*/\1/p' | xargs 2>/dev/null)
+
+    [ "$rci_token" = "null" ] && rci_token=""
+}
+get_rci_token
+
+http_code=$(
+    curl -ksS -o /dev/null -w "%{http_code}" -H "X-Ndma-Tkn: $rci_token" "127.0.0.1:79/rci/show/version"
+)
+
+if [ "$http_code" = "403" ]; then
+    printf "  ${red}Ошибка${reset}: Отсутствует или недействителен ${light_blue}токен доступа${reset} к RCI
+
+  Для ${green}KeeneticOS 5.2${reset} и выше требуется ${light_blue}токен доступа${reset}
+  Создайте его в веб-интерфейсе и укажите в ${yellow}xkeen.json${reset}\n"
+    exit 1
+fi
+
+# Параметры curl
+curl_api() {
+    if [ -n "$rci_token" ]; then
+        curl --connect-timeout 2 -m 5 -kfsS -H "X-Ndma-Tkn: $rci_token" "$@"
+    else
+        curl --connect-timeout 2 -m 5 -kfsS "$@"
+    fi
+}
+
+curl_with_timeout() {
+    # Функция динамической очистки и форматирования баров в реальном времени
+    indent_stderr_live() {
+        # Меняем RS (разделитель строк) в awk на '\r'
+        awk -v RS='\r' '{
+            # Удаляем мусор (таблицы, ошибки curl)
+            if ($0 ~ /(% Total|Average Speed|Time Current|curl:)/) next;
+            if ($0 ~ /^[[:space:]]*$/) next;
+
+            # Если это самый первый символ прогресс-бара, делаем начальный отступ
+            if (first == 0 && $0 ~ /^[# ]/) {
+                printf "  "
+                first = 1
+            }
+
+            # Выводим бар обратно в stderr с возвратом каретки и отступом
+            printf "%s\r  ", $0
+            fflush()
+        }
+        END {
+            # Если выполнение закончилось, принудительно сбрасываем каретку
+            # в самый левый край (\r), чтобы стереть паразитный отступ для caller-скрипта
+            printf "\r"
+            fflush()
+        }' >&2
+    }
+
+    # Проверяем контекст: если вывод в /dev/null или это HEAD-запрос (-I), то это проверка (probe)
+    _is_probe=0
+    for _arg in "$@"; do
+        [ "$_arg" = "/dev/null" ] || [ "$_arg" = "-I" ] && _is_probe=1 && break
+    done
+
+    if [ "$_is_probe" = "0" ]; then
+        # Режим скачивания (fetch_with_mirrors)
+        # Код возврата curl снимаем через отдельный дескриптор: $? после пайпа
+        # вернул бы код awk из indent_stderr_live, а не curl, из-за чего любой
+        # сетевой сбой выглядел бы как успех. pipefail в POSIX sh недоступен.
+        exec 3>&1
+        if [ -e "/tmp/toff" ]; then
+            _curl_rc=$( { { curl -# --connect-timeout 10 "$@" 2>&1 1>&3; echo $? >&4; } | indent_stderr_live; } 4>&1 )
+        else
+            _curl_rc=$( { { curl -# --connect-timeout 10 -m 180 "$@" 2>&1 1>&3; echo $? >&4; } | indent_stderr_live; } 4>&1 )
+        fi
+        exec 3>&-
+
+        return "${_curl_rc:-1}"
+    else
+        # Режим проверки доступности (probe_with_mirrors / test_github)
+        if [ -e "/tmp/toff" ]; then
+            curl --connect-timeout 10 "$@"
+        else
+            curl --connect-timeout 10 -m 180 "$@"
+        fi
+    fi
+}
+
+# Настройки балансировки по скорости (.xkeen.speed_balancer.*).
+# Вызывается по требованию из модуля -sb, а не глобально: несвязанным командам
+# xkeen лишний разбор xkeen.json не нужен. Значения по умолчанию — рабочие,
+# файл настроек не обязателен.
+speed_balancer_settings() {
+    sb_enabled="false"
+    sb_log_enabled="true"
+    sb_interval="15"
+    sb_hysteresis="25"
+    sb_balancer="balancer"
+    sb_maxtime="8"
+    # 50 МБ: endpoint Cloudflare __down отдаёт 403 на запрос больше ~50 МБ
+    sb_test_url="https://speed.cloudflare.com/__down?bytes=50000000"
+    # Имена файлов конфигурации Xray переопределяемы: ядро генерирует их с этими
+    # именами, но нигде их не enforce'ит — у пользователя раскладка может отличаться.
+    sb_routing_file="$xray_conf_dir/05_routing.json"
+    sb_outbounds_file="$xray_conf_dir/04_outbounds.json"
+
+    if [ -f "$xkeen_config" ] && command -v jq >/dev/null 2>&1; then
+        local json_clean
+        json_clean=$(strip_json_comments "$xkeen_config")
+
+        local v
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.enabled // empty' 2>/dev/null)
+        [ "$v" = "true" ] && sb_enabled="true"
+
+        # Логирование замеров/переключений можно отключить (.speed_balancer.log:
+        # false) — по умолчанию включено. Лог и так усечён до 200 строк, но кому-то
+        # он не нужен вовсе (запрос из issue #103). Читаем БЕЗ `// empty`: для
+        # булева false оператор // считает его пустым и вернул бы empty, из-за чего
+        # log:false никогда бы не срабатывал. Отсутствующий ключ даёт "null".
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.log' 2>/dev/null)
+        [ "$v" = "false" ] && sb_log_enabled="false"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.interval // empty' 2>/dev/null)
+        [ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null && sb_interval="$v"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.hysteresis // empty' 2>/dev/null)
+        [ -n "$v" ] && [ "$v" -ge 0 ] 2>/dev/null && sb_hysteresis="$v"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.balancer // empty' 2>/dev/null)
+        [ -n "$v" ] && sb_balancer="$v"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.max_time // empty' 2>/dev/null)
+        [ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null && sb_maxtime="$v"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.test_url // empty' 2>/dev/null)
+        [ -n "$v" ] && sb_test_url="$v"
+
+        # Имена файлов задаются базовыми — каталог остаётся xray_conf_dir.
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.routing_file // empty' 2>/dev/null)
+        [ -n "$v" ] && sb_routing_file="$xray_conf_dir/$v"
+
+        v=$(printf '%s' "$json_clean" | jq -r '.xkeen.speed_balancer.outbounds_file // empty' 2>/dev/null)
+        [ -n "$v" ] && sb_outbounds_file="$xray_conf_dir/$v"
+    fi
+}
