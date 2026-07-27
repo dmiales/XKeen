@@ -20,6 +20,11 @@
 - Для mihomo теперь автоматически выставляется GOMEMLIMIT (половина RAM устройства), что предотвращает рост потребления памяти и убийство процесса OOM-killer'ом на слабых роутерах [#100](https://github.com/jameszeroX/XKeen/pull/100) - [@dmiales](https://github.com/dmiales)
 - Функция curl_with_timeout теперь возвращает код возврата curl, а не awk из форматирования прогресс-бара - сетевые сбои при загрузке больше не маскируются под успех [#104](https://github.com/jameszeroX/XKeen/pull/104) - [@MrRefactoring](https://github.com/MrRefactoring)
 - Добавлена опциональная балансировка по [фактической скорости](https://github.com/jameszeroX/XKeen/wiki/Configuration#балансировка-по-фактической-скорости) серверов (xkeen -sb) - вместо штатного выбора Xray по задержке (leastPing) [#105](https://github.com/jameszeroX/XKeen/pull/105) - [@MrRefactoring](https://github.com/MrRefactoring)
+- **(combined-build)** `xkeen -ri` больше не сбрасывает `name_client`/политики и не останавливает прокси без восстановления
+- **(combined-build)** сбой чтения портов Keenetic через RCI больше не перенастраивает HTTP-порт веб-интерфейса
+- **(combined-build)** перед `-restart`/`-start` выполняется dry-run конфига (`mihomo -t` / `xray run -test`)
+- **(combined-build)** `-ug` на mihomo честно сообщает про `geo-auto-update`; шаблон config.yaml включает автообновление геоданных
+- **(combined-build)** атомарная установка XKeen + `gzip -t`/min-size для бинарников mihomo/xray
 
 ### Порядок установки/обновления
 

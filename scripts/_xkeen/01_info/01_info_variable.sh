@@ -90,7 +90,8 @@ target_dir="/opt"
 xkeen_api_url="https://api.github.com/repos/jameszeroX/xkeen/releases/latest"			# url api для XKeen
 xkeen_jsd_url="https://data.jsdelivr.com/v1/package/gh/jameszeroX/xkeen"			# резервный url api для XKeen
 xkeen_tar_url="https://github.com/jameszeroX/XKeen/releases/latest/download/xkeen.tar.gz"	# url для загрузки XKeen
-xkeen_dev_url="https://raw.githubusercontent.com/jameszeroX/xkeen/main/test/xkeen.tar.gz"	# url для загрузки XKeen dev
+# Personal combined-build: бета тянется с dmiales/XKeen, чтобы -uk ставил наши фиксы
+xkeen_dev_url="https://raw.githubusercontent.com/dmiales/XKeen/combined-build/test/xkeen.tar.gz"	# url для загрузки XKeen dev
 xray_api_url="https://api.github.com/repos/XTLS/Xray-core/releases"				# url api для Xray
 xray_jsd_url="https://data.jsdelivr.com/v1/package/gh/XTLS/Xray-core"				# резервный url api для Xray
 xray_zip_url="https://github.com/XTLS/Xray-core/releases/download"				# url для загрузки Xray

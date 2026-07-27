@@ -340,6 +340,9 @@ refresh_port_cache() { api_port_json=$(curl_api "${url_server}/${url_keenetic_po
 json_get_ports() { [ -n "$api_port_json" ] && printf '%s' "$api_port_json" | jq -r '.port, (.ssl.port // empty)' 2>/dev/null; }
 
 # Получение портов Keenetic
+# Важно: при сбое RCI НЕ меняем конфигурацию HTTP-портов роутера.
+# Старый fallback (ndmc ip http port 8080/80 + save) молча ломал
+# кастомные порты веб-интерфейса у пользователей.
 get_keenetic_port() {
     ports=""
     ports=$(json_get_ports)
@@ -349,15 +352,10 @@ get_keenetic_port() {
     esac
 
     if [ -z "$ports" ]; then
-        ndmc -c 'ip http port 8080' >/dev/null 2>&1
-        ndmc -c 'ip http port 80' >/dev/null 2>&1
-        ndmc -c 'system configuration save' >/dev/null 2>&1
-        sleep 2
-        refresh_port_cache
-        ports=$(json_get_ports)
+        log_warning_router "Не удалось получить порты HTTP Keenetic через RCI; проверка 443 пропущена"
+        echo ""
+        return 0
     fi
-
-    [ -n "$ports" ] || return 1
 
     echo "$ports"
     return 0
@@ -3314,6 +3312,18 @@ proxy_start() {
             fi
         else
             log_info_router "Инициирован запуск прокси-клиента"
+            if ! validate_core_config allow-timeout; then
+                log_error_router "Запуск отменён: конфигурация $name_client невалидна"
+                if [ "$_ps_mutex_rc" -eq 0 ]; then
+                    _release_proxy_mutex
+                    trap - INT TERM HUP
+                fi
+                _release_coldstart_guard
+                log_error_terminal "
+  Конфигурация ${yellow}$name_client${reset} не прошла проверку
+  Исправьте ошибки и повторите запуск
+"
+            fi
             attempt=1
 
             fd_limit="$other_fd"
@@ -3469,6 +3479,89 @@ wait_for_ready() {
     return 0
 }
 
+# Dry-run конфигурации ядра прокси.
+# Не трогает работающий процесс — вызывается до killall на restart
+# и перед первым запуском бинарника на start.
+#
+# $1 = allow-timeout — на cold start (сеть может быть ещё недоступна
+# из‑за rule-providers) таймаут не блокирует запуск.
+validate_core_config() {
+    _vc_allow_timeout="$1"
+    _vc_out=""
+    _vc_rc=0
+    _vc_timeout=30
+    _vc_has_timeout=0
+    command -v timeout >/dev/null 2>&1 && _vc_has_timeout=1
+
+    case "$name_client" in
+        mihomo)
+            if [ ! -x "$install_dir/mihomo" ]; then
+                echo -e "  ${red}Ошибка${reset}: бинарник mihomo не найден" >&2
+                return 1
+            fi
+            if [ ! -f "$mihomo_config" ]; then
+                echo -e "  ${red}Ошибка${reset}: отсутствует ${yellow}$mihomo_config${reset}" >&2
+                return 1
+            fi
+            if [ "$_vc_has_timeout" -eq 1 ]; then
+                _vc_out=$(
+                    export CLASH_HOME_DIR="$directory_configs_app"
+                    timeout "$_vc_timeout" "$install_dir/mihomo" -t -d "$directory_configs_app" 2>&1
+                )
+            else
+                _vc_out=$(
+                    export CLASH_HOME_DIR="$directory_configs_app"
+                    "$install_dir/mihomo" -t -d "$directory_configs_app" 2>&1
+                )
+            fi
+            _vc_rc=$?
+            ;;
+        xray)
+            if [ ! -x "$install_dir/xray" ]; then
+                echo -e "  ${red}Ошибка${reset}: бинарник xray не найден" >&2
+                return 1
+            fi
+            find "$directory_xray_config" -maxdepth 1 -name '._*.json' -type f -delete 2>/dev/null
+            if [ "$_vc_has_timeout" -eq 1 ]; then
+                _vc_out=$(
+                    export XRAY_LOCATION_CONFDIR="$directory_xray_config"
+                    export XRAY_LOCATION_ASSET="$directory_xray_asset"
+                    timeout "$_vc_timeout" "$install_dir/xray" run -test 2>&1
+                )
+            else
+                _vc_out=$(
+                    export XRAY_LOCATION_CONFDIR="$directory_xray_config"
+                    export XRAY_LOCATION_ASSET="$directory_xray_asset"
+                    "$install_dir/xray" run -test 2>&1
+                )
+            fi
+            _vc_rc=$?
+            ;;
+        *)
+            echo -e "  ${red}Ошибка${reset}: неизвестный прокси-клиент ${yellow}$name_client${reset}" >&2
+            return 1
+            ;;
+    esac
+
+    # timeout(1): 124; некоторые busybox: 143 (SIGTERM)
+    if [ "$_vc_rc" -eq 124 ] || [ "$_vc_rc" -eq 143 ]; then
+        if [ "$_vc_allow_timeout" = "allow-timeout" ]; then
+            echo -e "  ${yellow}Предупреждение${reset}: проверка конфигурации ${yellow}$name_client${reset} превысила таймаут — продолжаем запуск" >&2
+            log_warning_router "validate_core_config: timeout for $name_client, continuing start"
+            return 0
+        fi
+        echo -e "  ${red}Таймаут${reset} проверки конфигурации ${yellow}$name_client${reset}" >&2
+        return 1
+    fi
+
+    if [ "$_vc_rc" -ne 0 ]; then
+        echo -e "  Конфигурация ${yellow}$name_client${reset} ${red}не прошла проверку${reset}" >&2
+        printf '%s\n' "$_vc_out" | sed 's/^/  /' >&2
+        return 1
+    fi
+    return 0
+}
+
 # Остановка прокси-клиента
 proxy_stop() {
     _acquire_proxy_mutex
@@ -3560,7 +3653,15 @@ case "$1" in
             print_dscp_force_proxy_status
         fi
         ;;
-    restart) proxy_stop; proxy_start "$2" ;;
+    restart)
+        if ! validate_core_config; then
+            log_error_router "Перезапуск отменён: конфигурация $name_client невалидна"
+            echo -e "  Работающий процесс ${green}не остановлен${reset}"
+            exit 1
+        fi
+        proxy_stop
+        proxy_start "$2"
+        ;;
     cold_start)
         # Подстраховка: переписываем PID guard'а на свой ($$) на случай,
         # если caller-S05xkeen умер до того, как успел _set_coldstart_pid "$!".
