@@ -3810,7 +3810,7 @@ run_validation_watchdog() {
     "$@" > "$_rv_tmp" 2>&1 &
     _rv_pid=$!
     _rv_wait=0
-    while kill -0 "$_rv_pid" 2>/dev/null && [ "$_rv_wait" -lt 30 ]; do
+    while kill -0 "$_rv_pid" 2>/dev/null && [ "$_rv_wait" -lt 120 ]; do
         sleep 1
         _rv_wait=$((_rv_wait + 1))
     done
@@ -3832,7 +3832,7 @@ validate_core_config() {
     _vc_allow_timeout="$1"
     _vc_out=""
     _vc_rc=0
-    _vc_timeout=30
+    _vc_timeout=120
     _vc_has_timeout=0
     command -v timeout >/dev/null 2>&1 && _vc_has_timeout=1
 
@@ -3993,7 +3993,7 @@ case "$1" in
         fi
         ;;
     restart)
-        if ! validate_core_config; then
+        if ! validate_core_config allow-timeout; then
             log_error_router "Перезапуск отменён: конфигурация $name_client невалидна"
             echo -e "  Работающий процесс ${green}не остановлен${reset}"
             exit 1
