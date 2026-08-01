@@ -119,7 +119,10 @@ register_autostart() {
 
 # Создание конфигурации XKeen
 create_xkeen_cfg() {
+    previous_umask=$(umask)
+    umask 077
     mkdir -p "$xkeen_cfg" || { echo "Ошибка: Не удалось создать директорию $xkeen_cfg"; exit 1; }
+    chmod 700 "$xkeen_cfg" 2>/dev/null
     if [ -f "/opt/etc/xkeen_exclude.lst" ] && [ ! -f "$file_ip_exclude" ]; then
         mv "/opt/etc/xkeen_exclude.lst" "$file_ip_exclude"
     elif [ ! -f "$file_ip_exclude" ]; then
@@ -155,4 +158,6 @@ EOF
 }
 EOF
     fi
+    chmod 600 "$xkeen_config" 2>/dev/null
+    umask "$previous_umask"
 }

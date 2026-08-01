@@ -50,6 +50,37 @@ ru_exclude_ipv4="$ipset_cfg/ru_exclude_ipv4.lst"
 ru_exclude_ipv6="$ipset_cfg/ru_exclude_ipv6.lst"
 ru_override="$ipset_cfg/ru_exclude_override.lst"
 
+# Runtime state must stay in tmpfs, but must never be created in a
+# world-writable location.  Recreate a squatted or incorrectly-modeled dir.
+_xkeen_secure_rundir() {
+    d="/tmp/.xkeen"
+    if [ -e "$d" ] && [ ! -d "$d" ]; then
+        rm -f "$d" 2>/dev/null
+    fi
+    if [ -d "$d" ]; then
+        set -- $(ls -ld "$d" 2>/dev/null)
+        mode="$1"
+        owner="$3"
+        if [ "$owner" != "root" ] || [ "$mode" != "drwx------" ]; then
+            rm -rf "$d" 2>/dev/null
+        fi
+    fi
+    [ -d "$d" ] || mkdir -m 700 "$d" 2>/dev/null || return 1
+    chmod 700 "$d" 2>/dev/null || return 1
+    printf '%s' "$d"
+}
+if ! xkeen_rundir=$(_xkeen_secure_rundir); then
+    case "$1" in
+        stop|status)
+            xkeen_rundir="/tmp/.xkeen-unavailable"
+            logger -p warning -t XKeen "Недоступен runtime-каталог; продолжаем $1 без runtime-state"
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+fi
+
 # URL
 url_server="127.0.0.1:79"
 url_policy="rci/show/ip/policy"
@@ -171,6 +202,17 @@ get_rci_token() {
 }
 get_rci_token
 
+# Fail closed is deliberately opt-in.  Old configurations remain fail-open.
+load_killswitch_settings() {
+    killswitch="off"
+    [ -f "$xkeen_config" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    _ks_v=$(strip_json_comments "$xkeen_config" | jq -r '.xkeen.killswitch.enabled // false' 2>/dev/null)
+    [ "$_ks_v" = "true" ] && killswitch="on"
+    unset _ks_v
+}
+load_killswitch_settings
+
 # GOMEMLIMIT для mihomo: доля RAM или абсолютный лимит из xkeen.json.
 # Дефолт — 50% RAM (сохраняет прежнее поведение). Внешний
 # GOMEMLIMIT в окружении всегда побеждает.
@@ -243,15 +285,28 @@ wait_for_rci_token() {
         200) return 0 ;;
         401|403)
             log_error_router "Отсутствует или недействителен токен доступа к RCI роутера"
-            log_error_terminal "Отсутствует или недействителен токен доступа к RCI роутера"
+            if [ "$rci_token_fatal" = "true" ]; then
+                log_error_terminal "Отсутствует или недействителен токен доступа к RCI роутера"
+            fi
             ;;
         *)
             log_error_router "RCI не отвечает (http_code=$http_code)"
-            log_error_terminal "RCI не отвечает (http_code=$http_code)"
+            if [ "$rci_token_fatal" = "true" ]; then
+                log_error_terminal "RCI не отвечает (http_code=$http_code)"
+            fi
             ;;
     esac
 }
-wait_for_rci_token
+case "$1" in
+    stop|status)
+        rci_token_fatal="false"
+        wait_for_rci_token || log_warning_router "RCI недоступен: выполняется $1 без проверки политик"
+        ;;
+    *)
+        rci_token_fatal="true"
+        wait_for_rci_token
+        ;;
+esac
 
 # Параметры curl
 curl_api() {
@@ -1160,10 +1215,10 @@ get_modules() {
 }
 
 # Получение transparent inbound'ов Xray
-_invalidate_inbounds_cache() { rm -f /tmp/xkeen-inbounds-cache; }
+_invalidate_inbounds_cache() { rm -f "$xkeen_rundir/inbounds-cache"; }
 
 get_xray_transparent_inbounds() {
-    cache_file="/tmp/xkeen-inbounds-cache"
+    cache_file="$xkeen_rundir/inbounds-cache"
     cache_valid=0
     if [ -f "$cache_file" ]; then
         newer=$(find "$directory_xray_config" -maxdepth 1 -name '*.json' -newer "$cache_file" 2>/dev/null | head -n 1)
@@ -2052,7 +2107,19 @@ configure_firewall() {
     cat > "$file_netfilter_hook" <<'EOL'
 #!/bin/sh
 # XKeen: Auto-generated file. DO NOT EDIT!
-[ -f /tmp/xkeen_ready ] || exit 0
+_xkeen_secure_rundir() {
+    d="/tmp/.xkeen"
+    if [ -e "$d" ] && [ ! -d "$d" ]; then rm -f "$d" 2>/dev/null; fi
+    if [ -d "$d" ]; then
+        set -- $(ls -ld "$d" 2>/dev/null)
+        [ "$3" = "root" ] && [ "$1" = "drwx------" ] || rm -rf "$d" 2>/dev/null
+    fi
+    [ -d "$d" ] || mkdir -m 700 "$d" 2>/dev/null || return 1
+    chmod 700 "$d" 2>/dev/null || return 1
+    printf '%s' "$d"
+}
+_xkeen_rundir=$(_xkeen_secure_rundir) || exit 1
+[ -f "$_xkeen_rundir/ready" ] || exit 0
 case "${table:-}" in filter|raw) exit 0 ;; esac
 EOL
 
@@ -2119,9 +2186,12 @@ EOL
     inject_var url_server "$url_server"
     inject_var url_hotspot "$url_hotspot"
     inject_var rci_token "$rci_token"
+    inject_var ru_exclude_ipv4 "$ru_exclude_ipv4"
+    inject_var ru_exclude_ipv6 "$ru_exclude_ipv6"
     # GOMEMLIMIT для respawn mihomo внутри хука (вычислен при генерации)
     apply_gomemlimit
     inject_var gomemlimit_value "$gomemlimit_value"
+    inject_var killswitch "$killswitch"
 
     cat >> "$file_netfilter_hook" <<'EOL'
 
@@ -2147,7 +2217,7 @@ if pidof "$name_client" >/dev/null; then
     # mkdir — единственный атомарный lock в busybox-ash. Не дождались за
     # ~5 с — держатель уже применил актуальное состояние, выходим; если
     # правила всё же не целы, следующее событие NDM их доставит.
-    _xkeen_nf_lock="/tmp/xkeen_netfilter.lock.d"
+    _xkeen_nf_lock="$_xkeen_rundir/netfilter.lock.d"
     _xkeen_lock_owned=""
     _lock_try=0
     while [ "$_lock_try" -lt 50 ]; do
@@ -2847,12 +2917,32 @@ USER_POLICIES_EOF
         return 0
     }
 
+    # OOM can leave an existing geo set empty even though its list is valid.
+    # Refill only the broken state, keeping ordinary renews inexpensive.
+    _xkeen_refill_geo_if_empty() {
+        _rg_set="$1"
+        _rg_file="$2"
+        _rg_family="$3"
+        [ -s "$_rg_file" ] || return 0
+        ipset save "$_rg_set" 2>/dev/null | grep -q '^add ' && return 0
+        _rg_tmp="${_rg_set}_renew_tmp"
+        ipset create "$_rg_tmp" hash:net family "$_rg_family" -exist 2>/dev/null || return 1
+        ipset flush "$_rg_tmp" 2>/dev/null
+        if sed -e 's/\r$//' -e 's/#.*//' -e '/^[[:space:]]*$/d' "$_rg_file" | \
+             awk '{print "add '"$_rg_tmp"' "$1}' | ipset restore -exist; then
+            ipset swap "$_rg_set" "$_rg_tmp" 2>/dev/null || return 1
+        else
+            logger -p daemon.warning -t xkeen "не удалось восстановить $_rg_set из $_rg_file"
+        fi
+        ipset destroy "$_rg_tmp" 2>/dev/null
+    }
+
     # Текущий WAN IPv4 (тот же способ, что get_exclude_ip4 при генерации).
     # На коротком DHCP lease (MGTS ~300 с) renew приходит каждые ~150 с
     # с тем же IP: NDM всё равно зовёт netfilter.d. Если IP не сменился
     # и цепочки на месте — не трогаем даже configure_route (он и так
     # идемпотентен, но лишние ip route show на каждом renew не нужны).
-    _xkeen_wan_state="/tmp/xkeen_wan_ip"
+    _xkeen_wan_state="$_xkeen_rundir/wan_ip"
     _xkeen_cur_wan=$(ip -o route get 195.208.4.1 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p' || \
                      ip -o route get 77.88.8.8 2>/dev/null | sed -n 's/.*src \([^ ]*\).*/\1/p')
     _xkeen_prev_wan=$(cat "$_xkeen_wan_state" 2>/dev/null)
@@ -2860,6 +2950,8 @@ USER_POLICIES_EOF
     if [ -n "$_xkeen_cur_wan" ] && [ "$_xkeen_cur_wan" = "$_xkeen_prev_wan" ] && _xkeen_rules_intact; then
         # IP тот же, цепочки целы: deny-MAC обновляет schedule.d —
         # здесь curl под lock только мешает соседним событиям NDM.
+        [ "$iptables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude "$ru_exclude_ipv4" inet
+        [ "$ip6tables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude6 "$ru_exclude_ipv6" inet6
         _xkeen_release_nf_lock
         exit 0
     fi
@@ -2881,7 +2973,7 @@ USER_POLICIES_EOF
     # перезагрузка очищает /tmp. При попадании в кэш хук сразу применяет
     # блобы — окно «NDM снёс цепочки, правил нет» сокращается до
     # длительности самих iptables-restore.
-    _xkeen_cache_dir="/tmp/xkeen_rules_cache"
+    _xkeen_cache_dir="$_xkeen_rundir/rules_cache"
 
     _xkeen_ensure_ipsets() {
         command -v ipset >/dev/null 2>&1 || return 0
@@ -2910,8 +3002,17 @@ USER_POLICIES_EOF
     _xkeen_cache_load() {
         for _cn in v4_nat v4_mangle v6_nat v6_mangle; do
             _cb=$(cat "$_xkeen_cache_dir/$_cn" 2>/dev/null)
-            [ -n "$_cb" ] && eval "_xkeen_${_cn}_rules=\"\$_cb
-\""
+            [ -n "$_cb" ] || continue
+            case "$_cn" in
+                v4_nat) _xkeen_v4_nat_rules="$_cb
+" ;;
+                v4_mangle) _xkeen_v4_mangle_rules="$_cb
+" ;;
+                v6_nat) _xkeen_v6_nat_rules="$_cb
+" ;;
+                v6_mangle) _xkeen_v6_mangle_rules="$_cb
+" ;;
+            esac
         done
     }
 
@@ -2923,12 +3024,19 @@ USER_POLICIES_EOF
         printf '%s' "$_xkeen_v6_nat_rules"    > "${_xkeen_cache_dir}.new/v6_nat"
         printf '%s' "$_xkeen_v6_mangle_rules" > "${_xkeen_cache_dir}.new/v6_mangle"
         md5sum "$0" 2>/dev/null | awk '{print $1}' > "${_xkeen_cache_dir}.new/key"
-        rm -rf "$_xkeen_cache_dir" 2>/dev/null
-        mv "${_xkeen_cache_dir}.new" "$_xkeen_cache_dir" 2>/dev/null
+        rm -rf "${_xkeen_cache_dir}.old" 2>/dev/null
+        [ -d "$_xkeen_cache_dir" ] && mv "$_xkeen_cache_dir" "${_xkeen_cache_dir}.old" 2>/dev/null
+        if mv "${_xkeen_cache_dir}.new" "$_xkeen_cache_dir" 2>/dev/null; then
+            rm -rf "${_xkeen_cache_dir}.old" 2>/dev/null
+        else
+            [ -d "${_xkeen_cache_dir}.old" ] && mv "${_xkeen_cache_dir}.old" "$_xkeen_cache_dir" 2>/dev/null
+        fi
     }
 
     if _xkeen_cache_valid; then
         _xkeen_ensure_ipsets
+        [ "$iptables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude "$ru_exclude_ipv4" inet
+        [ "$ip6tables_supported" = "true" ] && _xkeen_refill_geo_if_empty geo_exclude6 "$ru_exclude_ipv6" inet6
         _xkeen_cache_load
         [ "$iptables_supported" = "true" ] && configure_route 4
         [ "$ip6tables_supported" = "true" ] && configure_route 6
@@ -2995,7 +3103,7 @@ USER_POLICIES_EOF
 else
     # mkdir-lock с PID: обычный touch-файл залипал навсегда после OOM
     # посреди respawn mihomo из хука — следующие события NDM тихо no-op.
-    _xkeen_start_lock="/tmp/xkeen_starting.lock.d"
+    _xkeen_start_lock="$_xkeen_rundir/starting.lock.d"
     if ! mkdir "$_xkeen_start_lock" 2>/dev/null; then
         _sl_pid=$(cat "$_xkeen_start_lock/pid" 2>/dev/null)
         if [ -n "$_sl_pid" ] && kill -0 "$_sl_pid" 2>/dev/null; then
@@ -3005,7 +3113,7 @@ else
         mkdir "$_xkeen_start_lock" 2>/dev/null || exit 0
     fi
     printf '%s' "$$" > "$_xkeen_start_lock/pid"
-    trap 'rm -rf /tmp/xkeen_starting.lock.d' EXIT INT TERM
+    trap 'rm -rf "$_xkeen_start_lock"' EXIT INT TERM
 
     fd_limit="$other_fd"
     [ "$arm_cpu" = "true" ] && fd_limit="$arm64_fd"
@@ -3067,7 +3175,7 @@ EOL
 SCHEDULE_EOL
     chmod 755 "$file_schedule_hook"
 
-    sh "$file_netfilter_hook"
+    return 0
 }
 
 # Удаление правил iptables
@@ -3121,6 +3229,12 @@ clean_firewall() {
         if "$family" -w -t "$table" -nL "$force_chain" >/dev/null 2>&1; then
             "$family" -w -t "$table" -F "$force_chain" >/dev/null 2>&1
             "$family" -w -t "$table" -X "$force_chain" >/dev/null 2>&1
+        fi
+
+        killswitch_chain="${name_chain}_killswitch"
+        if "$family" -w -t "$table" -nL "$killswitch_chain" >/dev/null 2>&1; then
+            "$family" -w -t "$table" -F "$killswitch_chain" >/dev/null 2>&1
+            "$family" -w -t "$table" -X "$killswitch_chain" >/dev/null 2>&1
         fi
     }
 
@@ -3275,32 +3389,33 @@ info_health_binary() {
 # текущий $$ это caller (S05xkeen start), который завершается сразу;
 # проверка живости должна идти по PID фонового cold_start ($!).
 _acquire_coldstart_guard() {
-    if mkdir "/tmp/xkeen_coldstart.lock.d" 2>/dev/null; then
-        touch "/tmp/xkeen_coldstart.lock"
+    if mkdir "$xkeen_rundir/coldstart.lock.d" 2>/dev/null; then
+        printf '%s\n' "$$" > "$xkeen_rundir/coldstart.lock.d/pid"
+        : > "$xkeen_rundir/coldstart.lock"
         return 0
     fi
-    _gpid=$(cat "/tmp/xkeen_coldstart.lock.d/pid" 2>/dev/null)
+    _gpid=$(cat "$xkeen_rundir/coldstart.lock.d/pid" 2>/dev/null)
     if [ -n "$_gpid" ] && kill -0 "$_gpid" 2>/dev/null; then
         return 1
     fi
-    # Без PID файла — guard свежий (caller ещё не дошёл до _set_coldstart_pid).
-    # Не сбрасываем: иначе теряем защиту в окне между mkdir и записью PID.
-    [ -z "$_gpid" ] && return 1
-    # PID есть, но процесс мёртв → stale, перехват
-    rm -rf "/tmp/xkeen_coldstart.lock.d"
-    mkdir "/tmp/xkeen_coldstart.lock.d" 2>/dev/null || return 1
-    touch "/tmp/xkeen_coldstart.lock"
+    # PID is written together with mkdir.  A guard without it is stale, not a
+    # permanent denial of service.
+    # PID exists but its process died → reclaim stale guard.
+    rm -rf "$xkeen_rundir/coldstart.lock.d"
+    mkdir "$xkeen_rundir/coldstart.lock.d" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$xkeen_rundir/coldstart.lock.d/pid"
+    : > "$xkeen_rundir/coldstart.lock"
     return 0
 }
 
 _set_coldstart_pid() {
-    [ -d "/tmp/xkeen_coldstart.lock.d" ] || return 0
-    echo "$1" > "/tmp/xkeen_coldstart.lock.d/pid"
+    [ -d "$xkeen_rundir/coldstart.lock.d" ] || return 0
+    printf '%s\n' "$1" > "$xkeen_rundir/coldstart.lock.d/pid"
 }
 
 _release_coldstart_guard() {
-    rm -rf "/tmp/xkeen_coldstart.lock.d"
-    rm -f "/tmp/xkeen_coldstart.lock"
+    rm -rf "$xkeen_rundir/coldstart.lock.d"
+    rm -f "$xkeen_rundir/coldstart.lock"
 }
 
 # Защита от параллельного входа в proxy_start/proxy_stop из двух
@@ -3310,31 +3425,31 @@ _release_coldstart_guard() {
 # (тот же процесс уже владеет mutex'ом, например proxy_start вложенно
 # вызывает proxy_stop при TProxy 443-конфликте — не релизим).
 _acquire_proxy_mutex() {
-    if mkdir "/tmp/xkeen_proxy.mutex.d" 2>/dev/null; then
-        echo $$ > "/tmp/xkeen_proxy.mutex.d/pid"
+    if mkdir "$xkeen_rundir/proxy.mutex.d" 2>/dev/null; then
+        printf '%s\n' "$$" > "$xkeen_rundir/proxy.mutex.d/pid"
         return 0
     fi
-    _mpid=$(cat "/tmp/xkeen_proxy.mutex.d/pid" 2>/dev/null)
+    _mpid=$(cat "$xkeen_rundir/proxy.mutex.d/pid" 2>/dev/null)
     if [ "$_mpid" = "$$" ]; then
         return 2
     fi
     if [ -n "$_mpid" ] && kill -0 "$_mpid" 2>/dev/null; then
         return 1
     fi
-    rm -rf "/tmp/xkeen_proxy.mutex.d"
-    mkdir "/tmp/xkeen_proxy.mutex.d" 2>/dev/null || return 1
-    echo $$ > "/tmp/xkeen_proxy.mutex.d/pid"
+    rm -rf "$xkeen_rundir/proxy.mutex.d"
+    mkdir "$xkeen_rundir/proxy.mutex.d" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$xkeen_rundir/proxy.mutex.d/pid"
     return 0
 }
 
 _release_proxy_mutex() {
-    rm -rf "/tmp/xkeen_proxy.mutex.d"
+    rm -rf "$xkeen_rundir/proxy.mutex.d"
 }
 
 # Тот же mkdir-lock, что у netfilter-хука. Нужен stop/emergency_clear,
 # чтобы не сносить цепочки посреди iptables-restore на DHCP renew.
 _acquire_nf_lock() {
-    _xkeen_nf_lock="/tmp/xkeen_netfilter.lock.d"
+    _xkeen_nf_lock="$xkeen_rundir/netfilter.lock.d"
     _xkeen_lock_owned=""
     _lock_try=0
     while [ "$_lock_try" -lt 50 ]; do
@@ -3366,9 +3481,49 @@ _acquire_nf_lock() {
 
 _release_nf_lock() {
     if [ "$_xkeen_lock_owned" = "1" ]; then
-        rm -rf "/tmp/xkeen_netfilter.lock.d" 2>/dev/null
+        rm -rf "$xkeen_rundir/netfilter.lock.d" 2>/dev/null
         _xkeen_lock_owned=""
     fi
+}
+
+# Install an explicit fail-closed policy only after an unintentional core
+# failure.  Only traffic already selected by xkeen policy marks is dropped;
+# LAN/management and all unmarked traffic remain untouched.  The restore blob
+# is atomic and uses the same netfilter lock as normal cleanup.
+enable_killswitch() {
+    [ "$killswitch" = "on" ] || return 0
+    _ks_marks="$policy_mark $policy_mark_full"
+    if [ -n "$user_policies" ]; then
+        _ks_user_marks=$(printf '%s\n' "$user_policies" | awk -F'|' '$2 != "" {print "0x"$2}')
+        _ks_marks="$_ks_marks $_ks_user_marks"
+    fi
+    [ -n "$(printf '%s' "$_ks_marks" | tr -d ' ')" ] || {
+        log_warning_router "Kill-switch не установлен: нет policy-mark для безопасной выборки трафика"
+        return 1
+    }
+
+    _acquire_nf_lock || return 1
+    for _ks_family in iptables ip6tables; do
+        if [ "$_ks_family" = "iptables" ] && [ "$iptables_supported" != "true" ]; then continue; fi
+        if [ "$_ks_family" = "ip6tables" ] && [ "$ip6tables_supported" != "true" ]; then continue; fi
+        _ks_restore="${_ks_family}-restore"
+        _ks_blob=$( {
+            printf '*mangle\n'
+            printf ':%s_killswitch -\n' "$name_chain"
+            for _ks_mark in $_ks_marks; do
+                [ -n "$_ks_mark" ] || continue
+                printf '%s\n' "-A ${name_chain}_killswitch -m conntrack ! --ctstate INVALID -m mark --mark ${_ks_mark} $comment -j DROP"
+            done
+            printf '%s\n' "-A PREROUTING $comment -j ${name_chain}_killswitch"
+            printf 'COMMIT\n'
+        } )
+        printf '%s' "$_ks_blob" | "$_ks_restore" --noflush || {
+            _release_nf_lock
+            return 1
+        }
+    done
+    _release_nf_lock
+    log_warning_router "Kill-switch включён: трафик политики xkeen заблокирован до явного stop/start"
 }
 
 # Очистка при аварийной остановке прокси-клиента
@@ -3379,10 +3534,11 @@ emergency_clear() {
     if [ "$_ec_mutex_rc" -eq 1 ]; then
         return 0
     fi
-    rm -f "/tmp/xkeen_ready"
+    rm -f "$xkeen_rundir/ready"
     _release_coldstart_guard
     cleanup_fd_monitor
     clean_firewall
+    enable_killswitch
     if [ "$_ec_mutex_rc" -eq 0 ]; then
         _release_proxy_mutex
     fi
@@ -3393,7 +3549,18 @@ proxy_start() {
     _acquire_proxy_mutex
     _ps_mutex_rc=$?
     if [ "$_ps_mutex_rc" -eq 1 ]; then
-        return 0
+        _ps_wait=0
+        while [ "$_ps_wait" -lt 5 ]; do
+            sleep 1
+            _acquire_proxy_mutex
+            _ps_mutex_rc=$?
+            [ "$_ps_mutex_rc" -ne 1 ] && break
+            _ps_wait=$((_ps_wait + 1))
+        done
+        if [ "$_ps_mutex_rc" -eq 1 ]; then
+            log_warning_terminal "Запуск занят другим процессом, повторите команду"
+            return 1
+        fi
     fi
     if [ "$_ps_mutex_rc" -eq 0 ]; then
         trap '_release_proxy_mutex; trap - INT TERM HUP' INT TERM HUP
@@ -3409,6 +3576,19 @@ proxy_start() {
         check_xray_backups
         api_cache_init
         policy_mark=$(get_policy_mark "$name_policy")
+        policy_mark_cache="$xkeen_cfg/.last_policy_mark"
+        if [ -n "$policy_mark" ]; then
+            _pm_tmp="${policy_mark_cache}.tmp.$$"
+            (umask 077; printf '%s\n' "$policy_mark" > "$_pm_tmp") &&
+                chmod 600 "$_pm_tmp" && mv -f "$_pm_tmp" "$policy_mark_cache"
+        elif [ -s "$policy_mark_cache" ]; then
+            _cached_mark=$(cat "$policy_mark_cache" 2>/dev/null)
+            case "$_cached_mark" in
+                0x[0-9A-Fa-f]*) policy_mark="$_cached_mark"; log_warning_router "RCI не вернул mark xkeen; используется последний успешный mark" ;;
+            esac
+        else
+            log_warning_router "RCI не вернул mark xkeen; без policy-mark будет применён явный режим проксирования всех"
+        fi
         policy_mark_full=$(get_policy_mark "$name_policy_full")
         user_policies=$(resolve_user_policies)
         validate_entware_proxy_mark
@@ -3468,10 +3648,27 @@ proxy_start() {
         fi
         if proxy_status; then
             echo -e "  Прокси-клиент уже ${green}запущен${reset}"
-            # Marker до configure_firewall: тот завершается `sh proxy.sh`,
-            # gate в хуке читает /tmp/xkeen_ready.
-            touch "/tmp/xkeen_ready"
-            [ "$mode_proxy" != "Other" ] && configure_firewall
+            if [ "$mode_proxy" != "Other" ] && ! configure_firewall; then
+                rm -f "$xkeen_rundir/ready"
+                log_error_terminal "Не удалось записать netfilter-хук"
+                _release_coldstart_guard
+                if [ "$_ps_mutex_rc" -eq 0 ]; then
+                    _release_proxy_mutex
+                    trap - INT TERM HUP
+                fi
+                return 1
+            fi
+            : > "$xkeen_rundir/ready"
+            if [ "$mode_proxy" != "Other" ] && ! sh "$file_netfilter_hook"; then
+                rm -f "$xkeen_rundir/ready"
+                log_error_terminal "Не удалось применить netfilter-хук"
+                _release_coldstart_guard
+                if [ "$_ps_mutex_rc" -eq 0 ]; then
+                    _release_proxy_mutex
+                    trap - INT TERM HUP
+                fi
+                return 1
+            fi
             if [ "$start_manual" = "on" ]; then
                 log_error_terminal "Не удалось запустить ${yellow}$name_client${reset}, так как он уже запущен"
             else
@@ -3530,9 +3727,27 @@ proxy_start() {
                 done
                 unset _probe_attempt
                 if proxy_status; then
-                    # См. alive-branch: marker до configure_firewall.
-                    touch "/tmp/xkeen_ready"
-                    [ "$mode_proxy" != "Other" ] && configure_firewall
+                    if [ "$mode_proxy" != "Other" ] && ! configure_firewall; then
+                        rm -f "$xkeen_rundir/ready"
+                        log_error_terminal "Не удалось записать netfilter-хук"
+                        _release_coldstart_guard
+                        if [ "$_ps_mutex_rc" -eq 0 ]; then
+                            _release_proxy_mutex
+                            trap - INT TERM HUP
+                        fi
+                        return 1
+                    fi
+                    : > "$xkeen_rundir/ready"
+                    if [ "$mode_proxy" != "Other" ] && ! sh "$file_netfilter_hook"; then
+                        rm -f "$xkeen_rundir/ready"
+                        log_error_terminal "Не удалось применить netfilter-хук"
+                        _release_coldstart_guard
+                        if [ "$_ps_mutex_rc" -eq 0 ]; then
+                            _release_proxy_mutex
+                            trap - INT TERM HUP
+                        fi
+                        return 1
+                    fi
                     # Последовательно: параллельный ipset restore больших RU-списков
                     # сразу после fork mihomo даёт пик RAM / OOM на слабых роутерах.
                     [ "$iptables_supported" = "true" ] && [ -f "$ru_exclude_ipv4" ] && load_ipset geo_exclude "$ru_exclude_ipv4" inet
@@ -3584,6 +3799,8 @@ proxy_start() {
                 attempt=$((attempt + 1))
             done
             echo -e "  ${red}Не удалось запустить${reset} прокси-клиент"
+            clean_firewall
+            enable_killswitch
             log_error_terminal "Не удалось запустить прокси-клиент"
             _release_coldstart_guard
         fi
@@ -3610,9 +3827,8 @@ wait_for_ready() {
             # Проверка готовности API политик и модуля xt_TPROXY
             api_policy_json=$(curl_api "${url_server}/${url_policy}" 2>/dev/null)
             case "$api_policy_json" in
-                ""|"{}")
-                    ;;
-                \{*)
+                ""|"{}"|"[]") return 0 ;;
+                \{*|\[*)
                     if [ -z "$_probe_ko" ] \
                        || grep -q '^xt_TPROXY ' /proc/modules 2>/dev/null \
                        || insmod "$_probe_ko" >/dev/null 2>&1
@@ -3633,17 +3849,28 @@ proxy_stop() {
     _acquire_proxy_mutex
     _pstop_mutex_rc=$?
     if [ "$_pstop_mutex_rc" -eq 1 ]; then
-        return 0
+        _pstop_wait=0
+        while [ "$_pstop_wait" -lt 5 ]; do
+            sleep 1
+            _acquire_proxy_mutex
+            _pstop_mutex_rc=$?
+            [ "$_pstop_mutex_rc" -ne 1 ] && break
+            _pstop_wait=$((_pstop_wait + 1))
+        done
+        if [ "$_pstop_mutex_rc" -eq 1 ]; then
+            log_warning_terminal "Остановка занята другим процессом, повторите команду"
+            return 1
+        fi
     fi
     if [ "$_pstop_mutex_rc" -eq 0 ]; then
         trap '_release_proxy_mutex; trap - INT TERM HUP' INT TERM HUP
     fi
-    rm -f "/tmp/xkeen_ready"
+    rm -f "$xkeen_rundir/ready"
     if ! proxy_status; then
         echo -e "  Прокси-клиент ${red}не запущен${reset}"
         cleanup_fd_monitor
     else
-        [ -f "/tmp/xkeen_coldstart.lock" ] || log_info_router "Инициирована остановка прокси-клиента"
+        [ -f "$xkeen_rundir/coldstart.lock" ] || log_info_router "Инициирована остановка прокси-клиента"
         cleanup_fd_monitor
         attempt=1
         while [ "$attempt" -le "$start_attempts" ]; do
@@ -3662,7 +3889,7 @@ proxy_stop() {
             fi
             if ! proxy_status; then
                 echo -e "  Прокси-клиент ${red}остановлен${reset}"
-                [ -f "/tmp/xkeen_coldstart.lock" ] || log_info_router "Прокси-клиент успешно остановлен"
+                [ -f "$xkeen_rundir/coldstart.lock" ] || log_info_router "Прокси-клиент успешно остановлен"
                 _release_coldstart_guard
                 if [ "$_pstop_mutex_rc" -eq 0 ]; then
                     _release_proxy_mutex

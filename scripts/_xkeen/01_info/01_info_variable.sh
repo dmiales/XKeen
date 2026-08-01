@@ -23,7 +23,6 @@ tmp_dir="/opt/tmp"			 # Временная директория
 ktmp_dir="$tmp_dir/xkeen"		 # Временная директория XKeen
 xtmp_dir="$tmp_dir/xray"		 # Временная директория Xray
 mtmp_dir="$tmp_dir/mihomo"		 # Временная директория Mihomo
-tmp_ram="/tmp/xkeen"			 # Временная директория в RAM
 install_dir="/opt/sbin"			 # Директория установки
 xkeen_dir="$install_dir/.xkeen"		 # Директория скриптов XKeen
 xkeen_cfg="/opt/etc/xkeen"		 # Директория конфигурации XKeen
@@ -58,6 +57,35 @@ file_netfilter_hook="/opt/etc/ndm/netfilter.d/proxy.sh"
 file_schedule_hook="/opt/etc/ndm/schedule.d/00-xkeen-hotspot-sync.sh"
 name_ipset_deny_mac="xkeen_deny_mac"
 
+# Root-only runtime state in tmpfs.  Do not use predictable top-level /tmp
+# paths: XKeen and its hooks run as root.
+_xkeen_secure_rundir() {
+    d="/tmp/.xkeen"
+    if [ -e "$d" ] && [ ! -d "$d" ]; then
+        rm -f "$d" 2>/dev/null
+    fi
+    if [ -d "$d" ]; then
+        set -- $(ls -ld "$d" 2>/dev/null)
+        mode="$1"
+        owner="$3"
+        if [ "$owner" != "root" ] || [ "$mode" != "drwx------" ]; then
+            rm -rf "$d" 2>/dev/null
+        fi
+    fi
+    [ -d "$d" ] || mkdir -m 700 "$d" 2>/dev/null || return 1
+    chmod 700 "$d" 2>/dev/null || return 1
+    printf '%s' "$d"
+}
+tmp_ram="$(_xkeen_secure_rundir)/work.$$"
+
+verify_downloads_settings() {
+    verify_downloads="warn"
+    [ -f "$xkeen_config" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    _vd_value=$(strip_json_comments "$xkeen_config" | jq -r '.xkeen.verify_downloads // "warn"' 2>/dev/null)
+    case "$_vd_value" in strict|warn|off) verify_downloads="$_vd_value" ;; esac
+    unset _vd_value
+}
 # -------------------------------------
 # Балансировка по фактической скорости (xkeen -sb)
 # -------------------------------------
@@ -179,6 +207,7 @@ strip_json_comments() {
         print line
     }' "$@"
 }
+verify_downloads_settings
 
 # Параметры повтора загрузок
 retries_download_settings() {
@@ -279,7 +308,7 @@ curl_with_timeout() {
         # вернул бы код awk из indent_stderr_live, а не curl, из-за чего любой
         # сетевой сбой выглядел бы как успех. pipefail в POSIX sh недоступен.
         exec 3>&1
-        if [ -e "/tmp/toff" ]; then
+        if [ "${XKEEN_TIMEOUT_OFF:-}" = "1" ]; then
             _curl_rc=$( { { curl -# --connect-timeout 10 "$@" 2>&1 1>&3; echo $? >&4; } | indent_stderr_live; } 4>&1 )
         else
             _curl_rc=$( { { curl -# --connect-timeout 10 -m 180 "$@" 2>&1 1>&3; echo $? >&4; } | indent_stderr_live; } 4>&1 )
@@ -289,7 +318,7 @@ curl_with_timeout() {
         return "${_curl_rc:-1}"
     else
         # Режим проверки доступности (probe_with_mirrors / test_github)
-        if [ -e "/tmp/toff" ]; then
+        if [ "${XKEEN_TIMEOUT_OFF:-}" = "1" ]; then
             curl --connect-timeout 10 "$@"
         else
             curl --connect-timeout 10 -m 180 "$@"
